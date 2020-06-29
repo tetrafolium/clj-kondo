@@ -1,0 +1,27 @@
+inspecode:
+
+  cljfmt:
+    thresholds: { num-issues: 999 }
+
+  eastwood:
+    thresholds: { num-issues: 999 }
+
+  fossology:
+    thresholds: { num-issues: 999 }
+
+  grep:
+    thresholds: { num-issues: 999 }
+
+  jscpd:
+    thresholds: { num-issues: 999 }
+
+  kibit:
+    auto-fix: true
+    thresholds: { num-issues: 999 }
+
+  lein-test:
+    thresholds: { num-issues: 999 }
+
+  misspell:
+    auto-fix: true
+    thresholds: { num-issues: 999 }
