@@ -16,7 +16,7 @@ inspecode:
     thresholds: { num-issues: 999 }
 
   kibit:
-    auto-fix: true
+    #auto-fix: true
     thresholds: { num-issues: 999 }
 
   lein-test:
