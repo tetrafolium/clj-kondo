@@ -42,7 +42,11 @@
      (core-impl/process-files
       {:config config/default-config
        :findings (atom [])
-       :namespaces namespaces}
+       :ignores (atom {})
+       :namespaces namespaces
+       :used-namespaces (atom {:clj #{}
+                               :cljs #{}
+                               :cljc #{}})}
       [(io/file (System/getProperty "user.home")
                 ".m2" "repository" "org" "clojure" "clojure"
                 "1.10.2-alpha1" "clojure-1.10.2-alpha1.jar")]
@@ -60,7 +64,11 @@
      (core-impl/process-files
       {:config config/default-config
        :findings (atom [])
-       :namespaces namespaces}
+       :ignores (atom {})
+       :namespaces namespaces
+       :used-namespaces (atom {:clj #{}
+                               :cljs #{}
+                               :cljc #{}})}
       [(io/file (System/getProperty "user.home")
                 ".m2" "repository" "org" "clojure" "clojurescript"
                 "1.10.520" "clojurescript-1.10.520.jar")]

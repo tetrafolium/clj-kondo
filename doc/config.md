@@ -13,25 +13,37 @@ Table of contents:
 
 ## Introduction
 
-Clj-kondo can be configured in four ways, by providing:
+Clj-kondo can be configured in five ways, by providing:
 
-- a `config.edn` file in the `.clj-kondo` directory (see [project setup](../README.md#project-setup))
-- a `--config` file argument from the command line
-- a `--config` EDN argument from the command line (see examples below)
-- a namespace local configuration using `:clj-kondo/config` metadata in the namespace form
+- home dir config in `~/.config/clj-kondo/config.edn` (respects `XDG_CONFIG_HOME`)
+- project config: a `config.edn` file in the `.clj-kondo` directory (see
+  [project setup](../README.md#project-setup))
+- `:config-paths` in project `config.edn`: a list of directories that provide additional config
+- command line `--config` file or EDN arguments
+- namespace local config using `:clj-kondo/config` metadata in the namespace form
 
-<!-- <img src="../screenshots/compojure-config.png"> -->
+The configurations are merged in the following order, where a later config overrides an earlier config:
 
-Config takes precedence in the order of namespace, command line,
-`.clj-kondo/config.edn`. Note that not all linters are currently supported in
-namespace local configuration. Also note that namespace local config must always be quoted.
+- home dir config
+- `:config-paths` in project config
+- project config
+- command line config
+- namespace local config
+
+The `^:replace` metadata hint can be used to replace parts or all of the
+configuration instead of merging with previous ones. The home dir config is
+implicitly part of `:config-paths`. To opt out of merging with home dir config
+use `:config-paths ^:replace []` in your project config.
+
+Note that namespace local config must always be quoted: `{:clj-kondo/config
+'{:linters ...}}` and quotes should not appear inside the config.
 
 Look at the [default configuration](../src/clj_kondo/impl/config.clj) for all
 available options.
 
-## Libraries
+## Examples
 
-See [libraries](../libraries) for library-specific configurations.
+See [examples](../examples) for library-specific configurations.
 
 ## Unrecognized macros
 
@@ -82,6 +94,26 @@ corpus/redundant_let.clj:4:3: info: redundant let
 corpus/redundant_let.clj:8:3: info: redundant let
 corpus/redundant_let.clj:12:3: info: redundant let
 ```
+
+### Ignore warnings in an expression
+
+To ignore all warnings in an expression, place a hint before it. It uses reader
+comments, so they won't end up in your runtime.
+
+``` clojure
+#_:clj-kondo/ignore
+(inc 1 2 3)
+```
+
+To ignore warnings from just one or a few linters:
+
+``` clojure
+#_{:clj-kondo/ignore [:invalid-arity]}
+(inc 1 2 3)
+```
+
+### Enable optional linters
+
 
 ### Lint a custom macro like a built-in macro
 
@@ -405,7 +437,7 @@ Hooks must be configured in clj-kondo's `config.edn` under `:hooks`, e.g.:
 ### analyze-call
 
 The `analyze-call` hook offers a way to lint macros that are unrecognized by clj-kondo and cannot
-be supported by [`:list-as`](#lint-a-custom-macro-like-a-built-in-macro).
+be supported by [`:lint-as`](#lint-a-custom-macro-like-a-built-in-macro).
 
 It receives Clojure macro (or function) call code as input in the form of a rewrite-clj node, and can:
 
@@ -455,12 +487,17 @@ This is the code for the hook:
       (throw (ex-info "No sym and val provided" {})))
     (let [new-node (api/list-node
                     (list*
-                     (api/token-node 'let)
+                     (api/token-node 'let*)
                      (api/vector-node [sym val])
                      opts
                      body))]
       {:node new-node})))
 ```
+
+Note, in order to prevent false positive `redundant-let` warning, when using
+this macro within actual let block, instead of using `(api/token-node 'let)`
+we're using `(api/token-node 'let*)`. Clj-kondo will lint `let*` syntactically
+the same, but won't report it as a nested `let`.
 
 This code will be placed in a file `hooks/with_bound.clj` in your `.clj-kondo`
 directory.
@@ -540,7 +577,7 @@ location.
 
 <img src="../screenshots/re-frame-hook.png"/>
 
-### Clojure Code as rewrite-clj nodes
+### Clojure code as rewrite-clj nodes
 
 If you develop a hook you will likely need some familiarity with rewrite-clj node structure.
 A couple of examples might help:
@@ -567,14 +604,24 @@ A couple of examples might help:
     - token node `inc`
     - token node `a`
 
+Clj-kondo uses a different approach to metadata than the original rewrite-clj
+library. Metadata nodes are stored in the `:meta` key on nodes correponding to
+the values carrying the metadata:
+
+`^:foo ^:bar []` becomes:
+
+- a vector node with `:meta`
+  - a seq of nodes with:
+    - keyword node `:foo`
+    - keyword node `:bar`
 
 ### Example Hooks
 
 - rewrite-cljc-playground: [import-vars-with-mod](https://github.com/lread/rewrite-cljc-playground/commit/09882e1244a8c12879ef8c1e6872724748e7914b)
 
-More examples of hooks can be found in the [libraries](../libraries)
-directory. Take a look at the [Rum](../libraries/rum) and
-[Slingshot](../libraries/slingshot) configuration.
+More examples of hooks can be found in the [examples](../examples)
+directory. Take a look at the [Rum](../examples/rum) and
+[Slingshot](../examples/slingshot) configuration.
 
 ### Tips and tricks
 
@@ -596,7 +643,7 @@ a library namespace and use `require` to load it from each hook's namespace.
 To test performance of a hook, you can write code which triggers the hook and
 repeat that expression `n` times (where `n` is a large number like
 1000000). Then lint the file with `clj-kondo --lint` and measure
-timing.
+timing. The `time` macro is also available within hooks code.
 
 ### Clojurists Together
 

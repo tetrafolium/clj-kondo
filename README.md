@@ -1,11 +1,12 @@
 <img src="logo/logo-300dpi.png" width="400px">
 
+[![Clojars Project](https://img.shields.io/clojars/v/clj-kondo.svg)](https://clojars.org/clj-kondo)
+[![Financial Contributors on Open Collective](https://opencollective.com/clj-kondo/all/badge.svg?label=financial+contributors)](https://opencollective.com/clj-kondo) 
 [![CircleCI](https://circleci.com/gh/borkdude/clj-kondo/tree/master.svg?style=shield)](https://circleci.com/gh/borkdude/clj-kondo/tree/master)
 [![Build status](https://ci.appveyor.com/api/projects/status/3jdro7mu17nv3rb3/branch/master?svg=true)](https://ci.appveyor.com/project/borkdude/clj-kondo/branch/master)
-[![Clojars Project](https://img.shields.io/clojars/v/clj-kondo.svg)](https://clojars.org/clj-kondo)
 [![cljdoc badge](https://cljdoc.org/badge/clj-kondo/clj-kondo)](https://cljdoc.org/d/clj-kondo/clj-kondo/CURRENT)
 [![project chat](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/messages/CHY97NXE2)
-[![Financial Contributors on Open Collective](https://opencollective.com/clj-kondo/all/badge.svg?label=financial+contributors)](https://opencollective.com/clj-kondo) 
+[![twitter](https://img.shields.io/badge/twitter-%23cljkondo-blue)](https://twitter.com/search?q=%23cljkondo&src=typed_query&f=live)
 
 A linter for Clojure code that sparks joy.
 
@@ -50,6 +51,7 @@ Clj-kondo detects:
 * alias consistency
 * [type checking](doc/types.md)
 * Datalog syntax checking
+* format string argument mismatches
 
 before your form hits the REPL.
 
@@ -129,7 +131,7 @@ entire classpath to teach `clj-kondo` about all the libraries you are using,
 including Clojure and/or ClojureScript itself:
 
 ``` shellsession
-$ clj-kondo --lint "<classpath>"
+$ clj-kondo --parallel --lint "<classpath>"
 ```
 
 Build tool specific ways to get a classpath:
@@ -139,7 +141,15 @@ Build tool specific ways to get a classpath:
 
 So for `lein` the entire command would be:
 
-    $ clj-kondo --lint "$(lein classpath)"
+    $ clj-kondo --parallel --lint "$(lein classpath)"
+
+For `boot` the entire command would be:
+
+    $ clj-kondo --parallel --lint "$(boot with-cp -w -f -)"
+
+And for `clojure` CLI, the entire command would be:
+
+    $ clj-kondo --parallel --lint "$(clojure -Spath)"
 
 Now you are ready to lint single files using [editor
 integration](doc/editor-integration.md). A simulation of what happens when you

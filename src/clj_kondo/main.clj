@@ -36,12 +36,14 @@ Options:
   nearest `.clj-kondo` directory in the current and parent directories.
 
   --config <config>: config may be a file or an EDN expression. See
-    https://cljdoc.org/d/clj-kondo/clj-kondo/%s/doc/configuration.
+    https://cljdoc.org/d/clj-kondo/clj-kondo/%s/doc/configuration
 
   --config-dir <config-dir>: use this config directory instead of auto-detected
     .clj-kondo dir.
 
   --run-as-pod: run clj-kondo as a babashka pod
+
+  --parallel: lint sources in parallel.
 " core-impl/version))
   nil)
 
@@ -57,6 +59,7 @@ Options:
     "--config-dir" :scalar
     "--lint"       :coll
     "--config"     :coll
+    "--parallel"   :scalar
     :scalar))
 
 (defn- parse-opts [options]
@@ -92,7 +95,11 @@ Options:
      :config-dir (last (get opts "--config-dir"))
      :version (contains? opts "--version")
      :help (contains? opts "--help")
-     :pod (= "true" (System/getenv "BABASHKA_POD"))}))
+     :pod (= "true" (System/getenv "BABASHKA_POD"))
+     :parallel (let [[k v] (find opts "--parallel")]
+                 (when k
+                   (or (nil? v)
+                       (= "true" v))))}))
 
 (defn main
   [& options]

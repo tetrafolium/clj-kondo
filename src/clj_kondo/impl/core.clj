@@ -69,14 +69,67 @@
           ;; config is a string that represents a file
           (read-edn-file (io/file config)))))
 
+(declare resolve-config-paths)
+
+(defn process-cfg-dir
+  "Reads config from dir if not already passed and adds dir to
+  classpath (even if there is no config in it)."
+  ([dir]
+   (let [cfg (let [dir (io/file dir)
+                   f (io/file dir "config.edn")]
+               (when (.exists f)
+                 (read-edn-file f)))]
+     (process-cfg-dir dir cfg)))
+  ([dir cfg]
+   (let [cfg (assoc cfg :classpath [dir])]
+     (resolve-config-paths dir cfg))))
+
+(defn sanitize-path [cfg-dir path]
+  (let [f (io/file path)]
+    (if (.isAbsolute f)
+      (when (.exists f) f)
+      (let [f (io/file cfg-dir path)]
+        (when (.exists f)
+          f)))))
+
+(defn sanitize-paths [cfg-dir paths]
+  (keep #(sanitize-path cfg-dir %) paths))
+
+(defn home-config []
+  (let [home-dir  (if-let [xdg-config-home (System/getenv "XDG_CONFIG_HOME")]
+                    (io/file xdg-config-home "clj-kondo")
+                    (io/file (System/getProperty "user.home") ".config" "clj-kondo"))]
+    (when (.exists home-dir)
+      (process-cfg-dir home-dir))))
+
+(defn resolve-config-paths
+  "Takes config from .clj-kondo/config.edn (or other cfg-dir),
+  inspects :config-paths, merges configs from left to right with cfg
+  last."
+  [cfg-dir cfg]
+  (if-let [config-paths (:config-paths cfg)]
+    (if-let [paths (sanitize-paths cfg-dir config-paths)]
+      (let [configs (map process-cfg-dir paths)
+            merged (reduce config/merge-config! configs)
+            ;; cfg is merged last
+            cfg (config/merge-config! merged cfg)]
+        cfg)
+      cfg)
+    cfg))
+
 (defn resolve-config [^java.io.File cfg-dir configs]
-  (let [config
-        (reduce config/merge-config! config/default-config
-                (into [(when cfg-dir
-                         (let [f (io/file cfg-dir "config.edn")]
-                           (when (.exists f)
-                             (read-edn-file f))))]
-                      (map read-config configs)))]
+  (let [local-config (when cfg-dir
+                       (let [f (io/file cfg-dir "config.edn")]
+                         (when (.exists f)
+                           (read-edn-file f))))
+        skip-home? (some-> local-config :config-paths meta :replace)
+        config
+        (reduce config/merge-config!
+                config/default-config
+                (cons
+                 (when-not skip-home? (home-config))
+                 (cons (when cfg-dir (process-cfg-dir cfg-dir local-config))
+                       (map read-config configs))))]
     (cond-> config
       cfg-dir (assoc :cfg-dir (.getCanonicalPath cfg-dir)))))
 
@@ -127,7 +180,8 @@
               {:filename (str (when canonical?
                                 (str (.getCanonicalPath jar-file) ":"))
                               (.getName entry))
-               :source (slurp (.getInputStream jar entry))}) entries))))
+               :source (slurp (.getInputStream jar entry))
+               :group-id jar-file}) entries))))
 
 ;;;; dir processing
 
@@ -143,11 +197,40 @@
               (cond
                 (and can-read? source?)
                 {:filename nm
-                 :source (slurp file)}
+                 :source (slurp file)
+                 :group-id dir}
                 (and (not can-read?) source?)
                 (print-err! (str nm ":0:0:") "warning: can't read, check file permissions")
                 :else nil)))
           files)))
+
+;;;; threadpool
+
+(defn lint-task [ctx ^java.util.concurrent.LinkedBlockingDeque deque dev?]
+  (loop []
+    (when-let [group (.pollFirst deque)]
+      (try
+        (doseq [{:keys [:filename :source :lang]} group]
+          (ana/analyze-input ctx filename source lang dev?))
+        (catch Exception e (binding [*out* *err*]
+                             (prn e))))
+      (recur))))
+
+(defn parallel-lint [ctx sources dev?]
+  (let [source-groups (group-by :group-id sources)
+        source-groups (filter seq (vals source-groups))
+        deque     (java.util.concurrent.LinkedBlockingDeque. ^java.util.List source-groups)
+        _ (reset! (:sources ctx) []) ;; clean up garbage
+        cnt       (+ 2 (int (* 0.6 (.. Runtime getRuntime availableProcessors))))
+        latch     (java.util.concurrent.CountDownLatch. cnt)
+        es        (java.util.concurrent.Executors/newFixedThreadPool cnt)]
+    (dotimes [_ cnt]
+      (.execute es
+                (bound-fn []
+                  (lint-task ctx deque dev?)
+                  (.countDown latch))))
+    (.await latch)
+    (.shutdown es)))
 
 ;;;; file processing
 
@@ -163,6 +246,11 @@
 (defn classpath? [f]
   (str/includes? f path-separator))
 
+(defn schedule [ctx {:keys [:filename :source :lang] :as m} dev?]
+  (if (:parallel ctx)
+    (swap! (:sources ctx) conj m)
+    (ana/analyze-input ctx filename source lang dev?)))
+
 (defn process-file [ctx filename default-language canonical?]
   (try
     (let [file (io/file filename)]
@@ -171,27 +259,27 @@
         (if (.isFile file)
           (if (str/ends-with? (.getPath file) ".jar")
             ;; process jar file
-            (map #(ana/analyze-input ctx (:filename %) (:source %)
-                                     (lang-from-file (:filename %) default-language)
-                                     dev?)
-                 (sources-from-jar file canonical?))
+            (run! #(schedule ctx (assoc % :lang (lang-from-file (:filename %) default-language))
+                             dev?)
+                  (sources-from-jar file canonical?))
             ;; assume normal source file
-            [(ana/analyze-input ctx (if canonical?
-                                      (.getCanonicalPath file)
-                                      filename) (slurp file)
-                                (lang-from-file filename default-language)
-                                dev?)])
+            (schedule ctx {:filename (if canonical?
+                                       (.getCanonicalPath file)
+                                       filename)
+                           :source (slurp file)
+                           :lang (lang-from-file filename default-language)}
+                      dev?))
           ;; assume directory
-          (map #(ana/analyze-input ctx (:filename %) (:source %)
-                                   (lang-from-file (:filename %) default-language)
-                                   dev?)
-               (sources-from-dir file canonical?)))
+          (run! #(schedule ctx (assoc % :lang (lang-from-file (:filename %) default-language)) dev?)
+                (sources-from-dir file canonical?)))
         (= "-" filename)
-        [(ana/analyze-input ctx "<stdin>" (slurp *in*) default-language dev?)]
+        (schedule ctx {:filename "<stdin>"
+                       :source (slurp *in*)
+                       :lang default-language} dev?)
         (classpath? filename)
-        (mapcat #(process-file ctx % default-language canonical?)
-                (str/split filename
-                           (re-pattern path-separator)))
+        (run! #(process-file ctx % default-language canonical?)
+              (str/split filename
+                         (re-pattern path-separator)))
         :else
         (findings/reg-finding! ctx
                                {:filename (if canonical?
@@ -215,7 +303,9 @@
 
 (defn process-files [ctx files default-lang]
   (let [canonical? (-> ctx :config :output :canonical-paths)]
-    (mapcat #(process-file ctx % default-lang canonical?) files)))
+    (run! #(process-file ctx % default-lang canonical?) files)
+    (when (:parallel ctx)
+      (parallel-lint ctx @(:sources ctx) dev?))))
 
 ;;;; index defs and calls by language and namespace
 
@@ -260,15 +350,9 @@
      :cljs {:defs cljs}
      :cljc {:defs (mmerge cljc-clj cljc-cljs)}}))
 
-(defn index-defs-and-calls [ctx defs-and-calls]
-  ;; (prn ">" defs-and-calls)
+(defn index-defs-and-calls [ctx]
   (let [indexed-defs (namespaces->indexed-defs ctx)]
-    (reduce
-     (fn [acc {:keys [:used-namespaces :lang] :as _m}]
-       (-> acc
-           (update-in [lang :used-namespaces] into used-namespaces)))
-     indexed-defs
-     defs-and-calls)))
+    (assoc indexed-defs :used-namespaces @(:used-namespaces ctx))))
 
 ;;;; summary
 

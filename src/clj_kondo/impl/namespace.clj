@@ -152,6 +152,7 @@
                              (not (:doc metadata))
                              (not (:test metadata))
                              (not temp?)
+                             (not (:imported-var metadata))
                              (not
                               (when-let [defined-by (or (:linted-as metadata)
                                                         (:defined-by metadata))]
@@ -228,12 +229,14 @@
 
 (defn reg-required-namespaces!
   [{:keys [:base-lang :lang :namespaces] :as ctx} ns-sym analyzed-require-clauses]
-  (swap! namespaces update-in [base-lang lang ns-sym]
-         (fn [ns]
-           (lint-conflicting-aliases! ctx (:required analyzed-require-clauses))
-           (lint-unsorted-required-namespaces! ctx (:required analyzed-require-clauses))
-           (lint-duplicate-requires! ctx (:required ns) (:required analyzed-require-clauses))
-           (merge-with into ns analyzed-require-clauses)))
+  (lint-conflicting-aliases! ctx (:required analyzed-require-clauses))
+  (lint-unsorted-required-namespaces! ctx (:required analyzed-require-clauses))
+  (let [path [base-lang lang ns-sym]
+        ns (get-in @namespaces path)]
+    (lint-duplicate-requires! ctx (:required ns) (:required analyzed-require-clauses))
+    (swap! namespaces update-in path
+           (fn [ns]
+             (merge-with into ns analyzed-require-clauses))))
   nil)
 
 (defn reg-imports!
@@ -245,22 +248,22 @@
            (update ns :imports merge imports)))
   nil)
 
-(defn class-name? [s]
-  (let [splits (str/split s #"\.")]
-    (and (> (count splits) 2)
-         (Character/isUpperCase ^char (first (last splits))))))
+(defn class-name? [^String s]
+  (when-let [i (str/last-index-of s \.)]
+    (let [should-be-capital-letter-idx (inc i)]
+      (and (> (.length s) should-be-capital-letter-idx)
+           (Character/isUpperCase ^char (.charAt s (inc i)))))))
 
 (defn reg-unresolved-symbol!
-  [{:keys [:namespaces] :as _ctx}
-   ns-sym symbol {:keys [:base-lang :lang :config
-                         :callstack] :as sym-info}]
+  [ctx ns-sym symbol {:keys [:base-lang :lang :config
+                             :callstack] :as sym-info}]
   (when-not (or (:unresolved-symbol-disabled? sym-info)
                 (config/unresolved-symbol-excluded config
                                                    callstack symbol)
                 (let [symbol-name (name symbol)]
                   (or (str/starts-with? symbol-name ".")
                       (class-name? symbol-name))))
-    (swap! namespaces update-in [base-lang lang ns-sym :unresolved-symbols symbol]
+    (swap! (:namespaces ctx) update-in [base-lang lang ns-sym :unresolved-symbols symbol]
            (fn [old-sym-info]
              (if (nil? old-sym-info)
                sym-info

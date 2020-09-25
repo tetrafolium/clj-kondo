@@ -235,15 +235,23 @@
 
 (defn analyze-in-ns [ctx {:keys [:children] :as expr}]
   (let [{:keys [:row :col]} expr
+        lang (:lang ctx)
         ns-name (-> children second :children first :value)
         ns (when ns-name
-             (namespace-analyzer/new-namespace
-              (:filename ctx)
-              (:base-lang ctx)
-              (:lang ctx)
-              ns-name
-              :in-ns
-              row col))]
+             (-> (namespace-analyzer/new-namespace
+                  (:filename ctx)
+                  (:base-lang ctx)
+                  (:lang ctx)
+                  ns-name
+                  :in-ns
+                  row col)
+                 ;; fix fully qualified core references
+                 (assoc :qualify-ns (cond-> {}
+                                      (identical? :clj lang)
+                                      (assoc 'clojure.core 'clojure.core)
+                                      (identical? :cljs lang)
+                                      (assoc 'cljs.core 'cljs.core
+                                             'clojure.core 'cljs.core)))))]
     (namespace/reg-namespace! ctx ns)
     (analyze-children ctx (next children))
     ns))
@@ -471,6 +479,7 @@
            bindings (:bindings ctx)
            arities (:arities ctx)
            analyzed []]
+      (utils/handle-ignore ctx binding)
       (if binding
         (let [binding-tag (tag binding)
               binding-val (case binding-tag
@@ -787,13 +796,21 @@
        defrecord (analyze-defrecord ctx expr 'defrecord))
      (analyze-children ctx schemas))))
 
-(defn analyze-binding-call [ctx fn-name expr]
+(defn analyze-binding-call [ctx fn-name binding expr]
+  ;; TODO: optimize getting the filename from the ctx etc in this function, for the happy path
   (let [callstack (:callstack ctx)
         config (:config ctx)
         ns-name (-> ctx :ns :name)]
+    ;;(prn (:tag binding))
+    (when-let [k (types/keyword binding)]
+      (when-not (types/match? k :ifn)
+        (findings/reg-finding! ctx (node->line (:filename ctx) expr :error
+                                               :type-mismatch
+                                               (format "%s cannot be called as a function."
+                                                       (str/capitalize (types/label k)))))))
     (namespace/reg-used-binding! ctx
                                  ns-name
-                                 (get (:bindings ctx) fn-name))
+                                 binding)
     (when-not (config/skip? config :invalid-arity callstack)
       (let [filename (:filename ctx)
             children (:children expr)]
@@ -1105,15 +1122,11 @@
     (when arg-types
       (let [types @arg-types
             types (rest (map :tag types))
-            match-type (first types)
+            match-type (types/keyword (first types))
             matcher-type (second types)
-            matcher-type (if (map? matcher-type)
-                           (or (:tag matcher-type)
-                               (when (identical? :map (:type matcher-type))
-                                 :map))
-                           matcher-type)]
-        (when (and match-type (keyword? match-type)
-                   matcher-type (keyword? matcher-type)
+            matcher-type (types/keyword matcher-type)]
+        (when (and match-type
+                   matcher-type
                    (not (identical? matcher-type :any)))
           (case match-type
             :string (when (not (identical? matcher-type :string))
@@ -1155,6 +1168,44 @@
         ctx (ctx-with-bindings ctx (into {} (map #(extract-bindings ctx %) [idx-binding ret-binding])))]
     (analyze-children ctx [array body] false)))
 
+(defn analyze-format-string [ctx format-str-node format-str args]
+  (let [percents (re-seq #"%%?[^%]+" format-str)
+        [indexed unindexed]
+        (reduce (fn [[indexed unindexed :as acc] percent]
+                  (if (or (str/starts-with? percent "%%")
+                          (str/starts-with? percent "%n"))
+                    acc
+                    (if-let [[_ pos] (re-find #"^%(\d+)\$" percent)]
+                      [(max indexed (Integer/parseInt pos)) unindexed]
+                      [indexed (inc unindexed)]))) [0 0] percents)
+        percent-count (max indexed unindexed)
+        arg-count (count args)]
+    (when-not (= percent-count
+                 arg-count)
+      (findings/reg-finding! ctx (node->line (:filename ctx) format-str-node :error :format
+                                             (format "Format string expects %s arguments instead of %s."
+                                                     percent-count arg-count))))))
+
+(defn analyze-format [ctx expr]
+  (let [children (next (:children expr))
+        format-str-node (first children)
+        format-str (utils/string-from-token format-str-node)]
+    (when format-str
+      (analyze-format-string ctx format-str-node format-str (rest children)))
+    (analyze-children ctx children false)))
+
+(defn analyze-formatted-logging [ctx expr]
+  (let [children (next (:children expr))]
+    (loop [attempt 0
+           args (seq children)]
+      (when-first [a args]
+        (if-let [format-str (utils/string-from-token a)]
+          (analyze-format-string ctx a format-str (rest args))
+          (when (zero? attempt)
+            ;; format string can be either the first or second argument
+            (recur (inc attempt) (rest args))))))
+    (analyze-children ctx children false)))
+
 (defn analyze-call
   [{:keys [:top-level? :base-lang :lang :ns :config] :as ctx}
    {:keys [:arg-count
@@ -1193,7 +1244,7 @@
                                          [resolved-namespace resolved-name])]
                       [ns n true])
                     [resolved-namespace resolved-name false])
-                hook-fn (hooks/hook-fn config :analyze-call resolved-as-namespace resolved-as-name)
+                hook-fn (hooks/hook-fn ctx config :analyze-call resolved-as-namespace resolved-as-name)
                 transformed (when hook-fn
                               ;;;; Expand macro using user-provided function
                               (let [filename (:filename ctx)]
@@ -1218,34 +1269,34 @@
             (if-let [expanded (and transformed
                                    (:node transformed))]
               (do ;;;; This registers the macro call, so we still get arity linting
-                  (namespace/reg-var-usage! ctx ns-name {:type :call
-                                                         :resolved-ns resolved-namespace
-                                                         :ns ns-name
-                                                         :name (with-meta
-                                                                 (or resolved-name full-fn-name)
-                                                                 (meta full-fn-name))
-                                                         :unresolved? unresolved?
-                                                         :unresolved-ns unresolved-ns
-                                                         :clojure-excluded? clojure-excluded?
-                                                         :arity arg-count
-                                                         :row row
-                                                         :end-row (:end-row expr-meta)
-                                                         :col col
-                                                         :end-col (:end-col expr-meta)
-                                                         :base-lang base-lang
-                                                         :lang lang
-                                                         :filename (:filename ctx)
-                                                         :expr expr
-                                                         :callstack (:callstack ctx)
-                                                         :config (:config ctx)
-                                                         :top-ns (:top-ns ctx)
-                                                         :arg-types (:arg-types ctx)})
+                (namespace/reg-var-usage! ctx ns-name {:type :call
+                                                       :resolved-ns resolved-namespace
+                                                       :ns ns-name
+                                                       :name (with-meta
+                                                               (or resolved-name full-fn-name)
+                                                               (meta full-fn-name))
+                                                       :unresolved? unresolved?
+                                                       :unresolved-ns unresolved-ns
+                                                       :clojure-excluded? clojure-excluded?
+                                                       :arity arg-count
+                                                       :row row
+                                                       :end-row (:end-row expr-meta)
+                                                       :col col
+                                                       :end-col (:end-col expr-meta)
+                                                       :base-lang base-lang
+                                                       :lang lang
+                                                       :filename (:filename ctx)
+                                                       :expr expr
+                                                       :callstack (:callstack ctx)
+                                                       :config (:config ctx)
+                                                       :top-ns (:top-ns ctx)
+                                                       :arg-types (:arg-types ctx)})
                   ;;;; This registers the namespace as used, to prevent unused warnings
-                  (namespace/reg-used-namespace! ctx
-                                                 ns-name
-                                                 resolved-namespace)
-                  (let [node expanded]
-                    (analyze-expression** ctx node)))
+                (namespace/reg-used-namespace! ctx
+                                               ns-name
+                                               resolved-namespace)
+                (let [node expanded]
+                  (analyze-expression** ctx node)))
               ;;;; End macroexpansion
               (let [fq-sym (when (and resolved-namespace
                                       resolved-name)
@@ -1335,6 +1386,7 @@
                       this-as (analyze-this-as ctx expr)
                       memfn (analyze-memfn ctx expr)
                       empty? (analyze-empty? ctx expr)
+                      format (analyze-format ctx expr)
                       (use require)
                       (if top-level? (analyze-require ctx expr)
                           (analyze-children ctx children))
@@ -1407,6 +1459,14 @@
                          [clojure.java.jdbc with-db-metadata]
                          [next.jdbc with-transaction])
                         (jdbc/analyze-like-jdbc-with ctx expr)
+                        ([clojure.tools.logging debugf]
+                         [clojure.tools.logging infof]
+                         [clojure.tools.logging errorf]
+                         [clojure.tools.logging logf]
+                         [clojure.tools.logging spyf]
+                         [clojure.tools.logging tracef]
+                         [clojure.tools.logging warnf])
+                        (analyze-formatted-logging ctx expr)
                         ;; catch-all
                         (let [next-ctx (cond-> ctx
                                          (= '[clojure.core.async thread]
@@ -1506,6 +1566,7 @@
                      (format "symbol is called with %s args but expects 1 or 2"
                              arg-count)))))))
 
+;; TODO: this should just be a case of :type-mismatch
 (defn reg-not-a-function! [ctx expr type]
   (let [callstack (:callstack ctx)
         config (:config ctx)]
@@ -1528,6 +1589,7 @@
           t (tag expr)
           {:keys [:row :col]} (meta expr)
           arg-count (count (rest children))]
+      (utils/handle-ignore ctx expr)
       (when-not (one-of t [:map :list :quote]) ;; list and quote are handled specially because of return types
         (types/add-arg-type-from-expr ctx expr))
       (case t
@@ -1564,7 +1626,12 @@
                                    children))
         :fn (recur (assoc ctx :arg-types nil)
                    (macroexpand/expand-fn expr))
-        :token (when-not (or (:quoted ctx) (= :edn (:lang ctx))) (analyze-usages2 ctx expr))
+        :token
+        (if (:quoted ctx)
+          (when (:k expr)
+            (usages/analyze-keyword ctx expr))
+          (when-not (= :edn (:lang ctx))
+            (analyze-usages2 ctx expr)))
         :list
         (if-let [function (some->>
                            (first children)
@@ -1594,12 +1661,12 @@
                                             s))]
                     (let [full-fn-name (with-meta full-fn-name (meta function))
                           unresolved? (nil? (namespace full-fn-name))
-                          binding-call? (and unresolved?
-                                             (contains? bindings full-fn-name))]
-                      (if binding-call?
+                          binding (and unresolved?
+                                             (get bindings full-fn-name))]
+                      (if binding
                         (do
                           (types/add-arg-type-from-expr ctx expr)
-                          (analyze-binding-call ctx full-fn-name expr))
+                          (analyze-binding-call ctx full-fn-name binding expr))
                         (let [ret (analyze-call ctx {:arg-count arg-count
                                                      :full-fn-name full-fn-name
                                                      :row row
@@ -1655,49 +1722,43 @@
 
 (defn analyze-expression*
   "NOTE: :used-namespaces is used in the cache to load namespaces that were actually used."
-  [ctx results expression]
+  [ctx expression]
   (loop [ctx (assoc ctx
                     :bindings {}
                     :top-level? true)
          ns (:ns ctx)
-         [first-parsed & rest-parsed :as all] (analyze-expression** ctx expression)
-         results results]
+         [first-parsed & rest-parsed :as all]
+         (analyze-expression** ctx expression)]
     (if (seq all)
       (case (:type first-parsed)
-        nil (recur ctx ns rest-parsed results)
+        nil (recur ctx ns rest-parsed)
         (:ns :in-ns)
         (let [ns-name (:name first-parsed)
               local-config (:config first-parsed)
               global-config (:global-config ctx)
               new-config (config/merge-config! global-config local-config)]
+          (swap! (:used-namespaces ctx) update (:base-lang ctx) into (:used-namespaces first-parsed))
           (recur
            (-> ctx
                (assoc :config new-config)
                (update :top-ns (fn [n]
                                  (or n ns-name))))
            first-parsed
-           rest-parsed
-           (-> results
-               (assoc :ns first-parsed)
-               (update :used-namespaces into (:used-namespaces first-parsed))
-               (update :required into (:required first-parsed)))))
+           rest-parsed))
         :import-vars
         (do
           (namespace/reg-proxied-namespaces! ctx (:name ns) (:used-namespaces first-parsed))
+          (swap! (:used-namespaces ctx) update (:base-lang ctx) into (:used-namespaces first-parsed))
           (recur ctx
                  ns
-                 rest-parsed
-                 (update results :used-namespaces into (:used-namespaces first-parsed))))
+                 rest-parsed))
         ;; catch-all
-        (recur
-         ctx
-         ns
-         rest-parsed
-         (case (:type first-parsed)
-           :call
-           (update results :used-namespaces conj (:resolved-ns first-parsed))
-           results)))
-      [(assoc ctx :ns ns) results])))
+        (do (swap! (:used-namespaces ctx) update (:base-lang ctx) conj (:resolved-ns first-parsed))
+            (recur
+             ctx
+             ns
+             rest-parsed)))
+      (assoc ctx :ns ns))))
 
 (defn analyze-expressions
   "Analyzes expressions and collects defs and calls into a map. To
@@ -1714,16 +1775,14 @@
                         :calls-by-id (atom {})
                         :top-ns nil
                         :global-config config)]
+    (swap! (:used-namespaces ctx)
+           update base-lang into (:used-namespaces init-ns))
     (loop [ctx init-ctx
-           [expression & rest-expressions] expressions
-           results {:required (:required init-ns)
-                    :used-namespaces (:used-namespaces init-ns)
-                    :lang base-lang}]
+           [expression & rest-expressions] expressions]
       (if expression
-        (let [[ctx results]
-              (analyze-expression* ctx results expression)]
-          (recur ctx rest-expressions results))
-        results))))
+        (let [ctx (analyze-expression* ctx expression)]
+          (recur ctx rest-expressions))
+        nil))))
 
 ;;;; processing of string input
 
@@ -1762,19 +1821,17 @@
   [{:keys [:config] :as ctx} filename input lang dev?]
   ;; (prn "FILENAME" filename)
   (try
-    (let [parsed (p/parse-string input)
-          analyzed-expressions
-          (case lang
-            :cljc
-            (let [clj (analyze-expressions (assoc ctx :base-lang :cljc :lang :clj :filename filename)
-                                           (:children (select-lang parsed :clj)))
-                  cljs (analyze-expressions (assoc ctx :base-lang :cljc :lang :cljs :filename filename)
-                                            (:children (select-lang parsed :cljs)))]
-              (deep-merge clj cljs))
-            (:clj :cljs :edn)
-            (analyze-expressions (assoc ctx :base-lang lang :lang lang :filename filename)
-                                 (:children parsed)))]
-      analyzed-expressions)
+    (let [parsed (p/parse-string input)]
+      (case lang
+        :cljc
+        (do
+          (analyze-expressions (assoc ctx :base-lang :cljc :lang :clj :filename filename)
+                               (:children (select-lang parsed :clj)))
+          (analyze-expressions (assoc ctx :base-lang :cljc :lang :cljs :filename filename)
+                               (:children (select-lang parsed :cljs))))
+        (:clj :cljs :edn)
+        (analyze-expressions (assoc ctx :base-lang lang :lang lang :filename filename)
+                             (:children parsed))))
     (catch Exception e
       (if dev?
         (throw e)

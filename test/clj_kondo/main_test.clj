@@ -8,12 +8,19 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]
-   [clojure.test :as t :refer [deftest is testing]]
+   [clojure.test :as t :refer [deftest is testing *report-counters*]]
    [missing.test.assertions]))
 
 (defmethod clojure.test/report :begin-test-var [m]
   (println "===" (-> m :var meta :name))
   (println))
+
+(defmethod clojure.test/report :end-test-var [_m]
+  (let [{:keys [:fail :error]} @*report-counters*]
+    (when (and (= "true" (System/getenv "CLJ_KONDO_FAIL_FAST"))
+               (or (pos? fail) (pos? error)))
+      (println "=== Failing fast")
+      (System/exit 1))))
 
 (deftest inline-def-test
   (let [linted (lint! (io/file "corpus" "inline_def.clj") "--config" "{:linters {:redefined-var {:level :off}}}")
@@ -1020,7 +1027,9 @@ foo/foo ;; this does use the private var
     :message "foo/foo-2 is called with 3 args but expects 0"}
    (first (lint! "(ns foo) (defn foo-1 [] (in-ns 'bar)) (defn foo-2 []) (foo-2 1 2 3)")))
   (is (empty? (lint! "(let [ns-name \"user\"] (in-ns ns-name))"
-                     '{:linters {:unused-binding {:level :warning}}}))))
+                     '{:linters {:unused-binding {:level :warning}}})))
+  (is (empty? (lint! "(in-ns 'foo) (clojure.core/let [x 1])"
+                     '{:linters {:unresolved-symbol {:level :error}}}))))
 
 (deftest skip-args-test
   (is
@@ -1751,7 +1760,9 @@ foo/foo ;; this does use the private var
                      {:linters {:type-mismatch {:level :error}}})))
   (is (empty? (lint! "(def x) (doto x)")))
   (is (empty? (lint! "(def ^:private a 1) (let [{:keys [a] :or {a a}} {}] a)"
-                     {:linters {:unused-binding {:level :warning}}}))))
+                     {:linters {:unused-binding {:level :warning}}})))
+  (is (empty? (lint! "(scala.Int/MinValue)" {:linters {:unresolved-symbol {:level :error}}})))
+  (is (empty? (lint! "(require '[clojure.string :as s]) '::s/foo"))))
 
 (deftest proxy-super-test
   (is (empty? (lint! "
@@ -2168,7 +2179,12 @@ foo/foo ;; this does use the private var
                     (lint! "(ns consumer (:require [app.api :refer [foo]])) (foo 1)" "--cache"))
     (remove-dir ".clj-kondo")
     (when (.exists (io/file ".clj-kondo.bak"))
-      (rename-path ".clj-kondo.bak" ".clj-kondo"))))
+      (rename-path ".clj-kondo.bak" ".clj-kondo")))
+  (testing "..."
+    (is (empty? (lint! "(ns dev.clj-kondo {:clj-kondo/config '{:linters {:missing-docstring {:level :warning}}}}
+  (:require [potemkin :refer [import-vars]]))
+
+(import-vars [clojure.string blank?, starts-with?, ends-with?, includes?])")))))
 
 (deftest dir-with-source-extension-test
   (testing "analyses source in dir with source extension"
@@ -2270,6 +2286,9 @@ foo/foo ;; this does use the private var
       :level :warning,
       :message "Unused private var foo/f"})
    (lint! "(ns foo) (defn- f [])"))
+  (assert-submaps
+   '({:file "<stdin>", :row 1, :col 103, :level :warning, :message "Unused private var foo/g"})
+   (lint! "(ns foo {:clj-kondo/config '{:linters {:unused-private-var {:exclude [foo/f]}}}}) (defn- f []) (defn- g [])"))
   (is (empty? (lint! "(ns foo) (defn- f []) (f)")))
   (is (empty? (lint! "(ns foo) (defn- f [])"
                      '{:linters {:unused-private-var {:exclude [foo/f]}}}))))

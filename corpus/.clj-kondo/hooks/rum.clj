@@ -1,7 +1,7 @@
-(ns hooks.rum.defc
+(ns hooks.rum
   (:require [clj-kondo.hooks-api :as api]))
 
-(defn defc [{:keys [:node]}]
+(defn f [{:keys [:node]}]
   (let [args (rest (:children node))
         component-name (first args)
         args (next args)

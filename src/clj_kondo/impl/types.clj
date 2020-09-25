@@ -1,5 +1,6 @@
 (ns clj-kondo.impl.types
   {:no-doc true}
+  (:refer-clojure :exclude [keyword])
   (:require
    [clj-kondo.impl.config :as config]
    [clj-kondo.impl.findings :as findings]
@@ -34,7 +35,7 @@
    :keyword #{:ifn}
    :symbol #{:ifn}
    :associative #{:seqable :coll :ifn}
-   :transducer #{:ifn}
+   :transducer #{:ifn :fn}
    :list #{:seq :sequential :seqable :coll :stack}
    :seq #{:seqable :sequential :coll}
    :sequential #{:coll :seqable}})
@@ -50,6 +51,7 @@
    :associative #{:map :vector :sequential :stack}
    :ifn #{:fn :transducer :symbol :keyword :map :set :vector :associative :seqable :coll
           :sequential :stack}
+   :fn #{:transducer}
    :nat-int #{:pos-int}
    :seq #{:list :stack}
    :stack #{:list :vector :seq :sequential :seqable :coll :ifn :associative}
@@ -65,7 +67,7 @@
   "Returns the non-nilable version of k when it's nilable. Returns k otherwise."
   [k]
   (if (nilable? k)
-    (keyword (name k))
+    (clojure.core/keyword (name k))
     k))
 
 (def labels
@@ -179,7 +181,9 @@
     {:type :map
      :val (zipmap ks vtags)}))
 
-(defn ret-tag-from-call [ctx call _expr]
+(defn ret-tag-from-call
+  [ctx call _expr]
+  ;; Note, we need to return maps here because we are adding row and col later on.
   (or (:ret call)
       (when (not (:unresolved? call))
         (or (when-let [ret (:ret call)]
@@ -204,6 +208,16 @@
                   ;; we delay resolving this call, because we might find the spec for by linting other code
                   ;; see linters.clj
                   {:call (select-keys call [:filename :type :lang :base-lang :resolved-ns :ns :name :arity])})))))))
+
+(defn keyword
+  "Converts tagged item into single keyword, if possible."
+  [maybe-tag]
+  (if (keyword? maybe-tag) maybe-tag
+      (when (map? maybe-tag)
+        (if (identical? :map (:type maybe-tag))
+          :map
+          (when-let [t (:tag maybe-tag)]
+            (keyword t))))))
 
 (defn spec-from-list-expr [{:keys [:calls-by-id] :as ctx} expr]
   (when-let [id (:id expr)]

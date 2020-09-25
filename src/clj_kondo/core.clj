@@ -70,6 +70,8 @@
   In places where a file-like value is expected, either a path as string or a
   `java.io.File` may be passed, except for a classpath which must always be a string.
 
+  - `:parallel`: optional. A boolean indicating if sources should be linted in parallel.
+
   Returns a map with `:findings`, a seqable of finding maps, a
   `:summary` of the findings and the `:config` that was used to
   produce those findings. This map can be passed to `print!` to print
@@ -80,14 +82,19 @@
            :cache
            :cache-dir
            :config
-           :config-dir]
+           :config-dir
+           :parallel]
     :or {cache true}}]
   (let [start-time (System/currentTimeMillis)
         cfg-dir (or (when config-dir
                       (io/file config-dir))
                     (core-impl/config-dir (io/file (System/getProperty "user.dir"))))
         ;; for backward compatibility non-sequential config should be wrapped into collection
-        config (core-impl/resolve-config cfg-dir (if (sequential? config) config [config]))
+        config (if (System/getenv "CLJ_KONDO_DEV")
+                 (time (core-impl/resolve-config cfg-dir (if (sequential? config) config [config])))
+                 (core-impl/resolve-config cfg-dir (if (sequential? config) config [config])))
+        classpath (:classpath config)
+        config (dissoc config :classpath)
         cache-dir (when cache (core-impl/resolve-cache-dir cfg-dir cache cache-dir))
         findings (atom [])
         analysis? (get-in config [:output :analysis])
@@ -97,15 +104,22 @@
                           :var-definitions []
                           :var-usages []}))
         ctx {:config config
+             :classpath classpath
+             :global-config config
+             :sources (atom [])
              :findings findings
              :namespaces (atom {})
              :analysis analysis
-             :cache-dir cache-dir}
+             :cache-dir cache-dir
+             :used-namespaces (atom {:clj #{}
+                                     :cljs #{}
+                                     :cljc #{}})
+             :ignores (atom {})}
         lang (or lang :clj)
-        processed
-        ;; this is needed to force the namespace atom state
-        (doall (core-impl/process-files ctx lint lang))
-        idacs (core-impl/index-defs-and-calls ctx processed)
+        _ (core-impl/process-files (if parallel
+                                     (assoc ctx :parallel parallel)
+                                     ctx) lint lang)
+        idacs (core-impl/index-defs-and-calls ctx)
         idacs (cache/sync-cache idacs cache-dir)
         idacs (overrides idacs)
         _ (l/lint-var-usage ctx idacs)
